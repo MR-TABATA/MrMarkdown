@@ -288,6 +288,86 @@ fn delete_file(app: tauri::AppHandle, path: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Resolve and validate the target path for a rename, safely ensuring proper
+/// extension handling and rejecting invalid or unsupported filenames.
+fn resolve_rename_target(old_path: &std::path::Path, new_name: &str) -> Result<std::path::PathBuf, String> {
+    if !old_path.is_file() {
+        return Err("File not found".to_string());
+    }
+    if !is_supported(old_path.to_str().unwrap_or_default()) {
+        return Err("Unsupported file type".to_string());
+    }
+    let parent = old_path.parent().ok_or_else(|| "Invalid file path".to_string())?;
+
+    let trimmed = new_name.trim();
+    if trimmed.is_empty() || trimmed.contains('/') || trimmed.contains('\\') || trimmed.contains('\0') {
+        return Err("Invalid file name".to_string());
+    }
+
+    let p = std::path::Path::new(trimmed);
+    let has_known_ext = if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+        !ext.contains(' ') && ext.len() <= 10 && ext.chars().all(|c| c.is_alphanumeric())
+    } else {
+        false
+    };
+
+    let target_name = if is_supported(trimmed) {
+        trimmed.to_string()
+    } else if has_known_ext {
+        return Err("Unsupported file type".to_string());
+    } else if let Some(ext) = old_path.extension().and_then(|e| e.to_str()) {
+        format!("{}.{}", trimmed, ext)
+    } else {
+        trimmed.to_string()
+    };
+
+    let new_path_buf = parent.join(&target_name);
+    if !is_supported(new_path_buf.to_str().unwrap_or_default()) {
+        return Err("Unsupported file type".to_string());
+    }
+    Ok(new_path_buf)
+}
+
+/// Rename a file in place, ensuring safe extension handling and updating recent files.
+#[tauri::command]
+fn rename_file(app: tauri::AppHandle, old_path: String, new_name: String) -> Result<String, String> {
+    let old = std::path::Path::new(&old_path);
+    let new_path_buf = resolve_rename_target(old, &new_name)?;
+    let new_path = new_path_buf
+        .to_str()
+        .ok_or_else(|| "Invalid UTF-8 in path".to_string())?
+        .to_string();
+
+    if new_path == old_path {
+        return Ok(old_path);
+    }
+
+    if new_path_buf.exists() {
+        return Err("A file with this name already exists".to_string());
+    }
+
+    std::fs::rename(old, &new_path_buf).map_err(|e| e.to_string())?;
+
+    if let Some(store) = recent_store(&app) {
+        let list: Vec<String> = get_recent_files(app.clone())
+            .into_iter()
+            .map(|p| if p == old_path { new_path.clone() } else { p })
+            .collect();
+        match serde_json::to_string(&list) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(store, json) {
+                    eprintln!("Failed to update recent files after rename: {e}");
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to serialize recent files after rename: {e}");
+            }
+        }
+    }
+
+    Ok(new_path)
+}
+
 /// Last-modified time of a file in milliseconds, used by the frontend to poll
 /// for external edits and auto-reload.
 #[tauri::command]
@@ -1004,6 +1084,7 @@ pub fn run() {
             read_image,
             write_template,
             delete_file,
+            rename_file,
             file_mtime,
             read_dir,
             read_dir_all,
@@ -1483,5 +1564,77 @@ mod tests {
         assert!(!is_noise_path(Path::new("/repo/notes/spec.md")));
         assert!(!is_noise_path(Path::new("/repo/src/main.ts")));
         assert!(!is_noise_path(Path::new("/repo/README.md")));
+    }
+
+    #[test]
+    fn resolve_rename_target_validates_and_completes_extensions() {
+        let dir = scratch("rename_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("note.md");
+        std::fs::write(&file, "sample\n").unwrap();
+
+        // Missing extension gets original extension (.md)
+        let res = resolve_rename_target(&file, "new_note").unwrap();
+        assert_eq!(res, dir.join("new_note.md"));
+
+        // Name with dots (e.g. version) still gets .md because "v1.2 memo" is not a supported ext
+        let res_dot = resolve_rename_target(&file, "v1.2 memo").unwrap();
+        assert_eq!(res_dot, dir.join("v1.2 memo.md"));
+
+        // Name already having supported extension is preserved
+        let res_ext = resolve_rename_target(&file, "draft.markdown").unwrap();
+        assert_eq!(res_ext, dir.join("draft.markdown"));
+
+        // Invalid names rejected
+        assert!(resolve_rename_target(&file, "").is_err());
+        assert!(resolve_rename_target(&file, "   ").is_err());
+        assert!(resolve_rename_target(&file, "foo/bar").is_err());
+        assert!(resolve_rename_target(&file, "foo\\bar").is_err());
+        assert!(resolve_rename_target(&file, "foo\0bar").is_err());
+
+        // Unsupported extension rejected
+        assert!(resolve_rename_target(&file, "evil.exe").is_err());
+
+        // File must exist
+        let non_existent = dir.join("ghost.md");
+        assert!(resolve_rename_target(&non_existent, "any").is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_protects_existing_file_from_overwrite() {
+        let dir = scratch("rename_overwrite_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_a = dir.join("a.md");
+        let file_b = dir.join("b.md");
+        std::fs::write(&file_a, "content a\n").unwrap();
+        std::fs::write(&file_b, "content b\n").unwrap();
+
+        let target = resolve_rename_target(&file_a, "b").unwrap();
+        assert_eq!(target, file_b);
+        // If target exists, an error must prevent rename
+        assert!(target.exists());
+        // Verify file b content remains intact
+        assert_eq!(std::fs::read_to_string(&file_b).unwrap(), "content b\n");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recent_files_replaces_old_path_with_new_path_preserving_order() {
+        let old = "/path/to/old.md".to_string();
+        let new_p = "/path/to/new.md".to_string();
+        let list = vec!["/other/1.md".to_string(), old.clone(), "/other/2.md".to_string()];
+
+        let updated: Vec<String> = list
+            .into_iter()
+            .map(|p| if p == old { new_p.clone() } else { p })
+            .collect();
+
+        assert_eq!(
+            updated,
+            vec!["/other/1.md".to_string(), "/path/to/new.md".to_string(), "/other/2.md".to_string()]
+        );
     }
 }

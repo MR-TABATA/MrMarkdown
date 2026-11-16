@@ -296,6 +296,12 @@ const DICT = {
     folderTreeLargeOk: 'コピーする',
     closeConfirm: '「{name}」は未保存です。閉じますか？',
     deletedOnDisk: '（ディスク上で削除されました）',
+    copyPath: 'パスをコピー',
+    pathCopied: 'パスをコピーしました',
+    rename: '名前の変更',
+    renameFailed: '名前の変更に失敗しました',
+    fileExists: '同名のファイルが既に存在します',
+    invalidName: 'ファイル名が無効です',
   },
   en: {
     btnSidebar: 'Documents (⌘1)',
@@ -571,6 +577,12 @@ const DICT = {
     folderTreeLargeOk: 'Copy anyway',
     closeConfirm: '“{name}” has unsaved changes. Close it?',
     deletedOnDisk: '(deleted on disk)',
+    copyPath: 'Copy Path',
+    pathCopied: 'Path copied to clipboard',
+    rename: 'Rename',
+    renameFailed: 'Failed to rename',
+    fileExists: 'A file with this name already exists',
+    invalidName: 'Invalid file name',
   },
 } as const;
 

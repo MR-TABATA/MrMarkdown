@@ -51,6 +51,7 @@ import {
   type Seg,
 } from './diff';
 import { pushClosed, popReopenable, requeueClosed } from './closed-stack';
+import { deriveTitleFromContent } from './rename-utils';
 import { localDay, noteBaseline, parseBaselines, formatDelta, type Baselines } from './writing-stats';
 import { t, getLang, setLang, isSystemLang, type Lang, type Key } from './i18n';
 import {
@@ -222,6 +223,200 @@ const folderName = document.getElementById('folder-name')!;
 const folderTreeCopyBtn = document.getElementById('folder-tree-copy-btn') as HTMLButtonElement;
 const folderCloseBtn = document.getElementById('folder-close-btn') as HTMLButtonElement;
 const contentArea = document.querySelector('.content-area') as HTMLElement;
+const sidebarContextMenu = document.getElementById('sidebar-context-menu') as HTMLElement;
+const sidebarCtxRename = document.getElementById('sidebar-ctx-rename') as HTMLButtonElement;
+const sidebarCtxCopyPath = document.getElementById('sidebar-ctx-copy-path') as HTMLButtonElement;
+let contextMenuPath: string | null = null;
+let contextMenuTarget: HTMLElement | null = null;
+let contextMenuDoc: Doc | null = null;
+let isRenaming = false;
+let lastSelectedSidebarPath: string | null = null;
+
+function showSidebarContextMenu(e: MouseEvent, path: string | null, targetEl?: HTMLElement, doc?: Doc) {
+  e.preventDefault();
+  e.stopPropagation();
+  contextMenuPath = path;
+  contextMenuTarget = targetEl ?? (e.currentTarget as HTMLElement) ?? null;
+  contextMenuDoc = doc ?? (path ? docs.find((d) => d.path === path) : null) ?? null;
+  sidebarContextMenu.hidden = false;
+  sidebarCtxCopyPath.hidden = !path;
+  const menuWidth = 160;
+  const menuHeight = path ? 72 : 40;
+  const x = Math.min(e.clientX, window.innerWidth - menuWidth - 8);
+  const y = Math.min(e.clientY, window.innerHeight - menuHeight - 8);
+  sidebarContextMenu.style.left = `${Math.max(8, x)}px`;
+  sidebarContextMenu.style.top = `${Math.max(8, y)}px`;
+}
+
+function closeSidebarContextMenu() {
+  if (!sidebarContextMenu.hidden) {
+    sidebarContextMenu.hidden = true;
+    contextMenuPath = null;
+    contextMenuTarget = null;
+    contextMenuDoc = null;
+  }
+}
+
+function localizeRenameError(err: unknown): string {
+  const s = String(err);
+  if (s.includes('already exists')) return t('fileExists');
+  if (s.includes('Invalid file name')) return t('invalidName');
+  if (s.includes('Unsupported file type')) return `${t('renameFailed')}: ${t('invalidName')}`;
+  return t('renameFailed');
+}
+
+function startInlineRename(target: string | Doc, rowEl?: HTMLElement) {
+  if (isRenaming) return;
+  const path = typeof target === 'string' ? target : target.path;
+  const doc = typeof target === 'object' ? target : (path ? docs.find((d) => d.path === path) : null);
+
+  let targetRow = rowEl ?? null;
+  if (!targetRow && path) {
+    const treeRows = Array.from(folderTree.querySelectorAll('.tree-row')) as HTMLElement[];
+    targetRow = treeRows.find((r) => r.title === path) ?? null;
+  }
+  if (!targetRow && doc) {
+    targetRow = docRow.get(doc) ?? null;
+  }
+  if (!targetRow && path) {
+    const docRows = Array.from(docList.querySelectorAll('li')) as HTMLElement[];
+    targetRow = docRows.find((r) => r.title === path) ?? null;
+  }
+
+  if (!targetRow) return;
+
+  const nameEl = targetRow.querySelector('.tree-name, .doc-name') as HTMLElement | null;
+  if (!nameEl) return;
+
+  const oldName = nameEl.textContent || (doc ? doc.name : (path ? path.split('/').pop() : '')) || '';
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'inline-rename-input';
+  input.value = oldName;
+
+  isRenaming = true;
+  nameEl.textContent = '';
+  nameEl.appendChild(input);
+
+  const dotIndex = oldName.lastIndexOf('.');
+  const selectEnd = dotIndex > 0 ? dotIndex : oldName.length;
+  input.focus();
+  input.setSelectionRange(0, selectEnd);
+
+  let finished = false;
+  const finish = async (commit: boolean) => {
+    if (finished) return;
+    finished = true;
+    const newName = input.value.trim();
+    input.remove();
+    nameEl.textContent = oldName;
+    isRenaming = false;
+
+    if (!commit || !newName || newName === oldName) return;
+
+    if (!path) {
+      if (doc && docs.includes(doc)) {
+        doc.name = newName;
+        doc.customName = true;
+        renderSidebar();
+      }
+      return;
+    }
+
+    let newPath: string;
+    try {
+      newPath = await invoke<string>('rename_file', { oldPath: path, newName });
+    } catch (err) {
+      await confirmDialog(localizeRenameError(err), { title: t('rename'), kind: 'warning' });
+      return;
+    }
+
+    const matchingDocs = docs.filter((d) => d.path === path);
+    for (const openDoc of matchingDocs) {
+      openDoc.path = newPath;
+      openDoc.name = newPath.split('/').pop() || newName;
+    }
+    if (matchingDocs.length > 0) {
+      renderSidebar();
+    }
+    if (folderRoot) {
+      try {
+        await refreshFolderTree();
+      } catch (err) {
+        console.error('Failed to refresh folder tree after rename:', err);
+      }
+    }
+  };
+
+  input.addEventListener('keydown', (e) => {
+    e.stopPropagation();
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      finish(true);
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      finish(false);
+    }
+  });
+
+  input.addEventListener('blur', () => {
+    finish(false);
+  });
+}
+
+sidebarCtxRename.addEventListener('click', () => {
+  const p = contextMenuPath;
+  const doc = contextMenuDoc;
+  const target = contextMenuTarget;
+  closeSidebarContextMenu();
+  if (doc) {
+    startInlineRename(doc, target ?? undefined);
+  } else if (p) {
+    startInlineRename(p, target ?? undefined);
+  }
+});
+
+sidebarCtxCopyPath.addEventListener('click', async () => {
+  if (contextMenuPath) {
+    await copyText(contextMenuPath);
+  }
+  closeSidebarContextMenu();
+});
+
+/**
+ * Update the displayed name of an untitled document based on its first 24 characters,
+ * unless the user has explicitly given it a custom name.
+ */
+function updateUntitledName(doc: Doc) {
+  if (doc.path || doc.customName) return;
+  const title = deriveTitleFromContent(doc.workingText);
+  const newName = title || doc.defaultName || 'untitled';
+  if (doc.name !== newName) {
+    doc.name = newName;
+    const row = docRow.get(doc);
+    const nameEl = row?.querySelector('.doc-name');
+    if (nameEl) {
+      nameEl.textContent = newName;
+    } else {
+      renderSidebar();
+    }
+  }
+}
+
+document.addEventListener('click', (e) => {
+  if (!sidebarContextMenu.contains(e.target as Node)) {
+    closeSidebarContextMenu();
+  }
+});
+document.addEventListener('contextmenu', (e) => {
+  if (!sidebarContextMenu.contains(e.target as Node)) {
+    closeSidebarContextMenu();
+  }
+}, true);
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closeSidebarContextMenu();
+});
+window.addEventListener('blur', closeSidebarContextMenu);
 
 // A document open in the session. `workingText` is the editor buffer, which
 // may differ from what's on disk (`savedSource`) until saved. `path` is null
@@ -229,6 +424,8 @@ const contentArea = document.querySelector('.content-area') as HTMLElement;
 interface Doc {
   path: string | null;
   name: string;
+  defaultName?: string;
+  customName?: boolean;
   savedSource: string;
   workingText: string;
   mtime: number;
@@ -1095,11 +1292,24 @@ function renderSidebar() {
     li.append(close);
     rowDoc.set(li, doc);
     docRow.set(doc, li);
+    li.addEventListener('contextmenu', (e) => {
+      showSidebarContextMenu(e, doc.path, li, doc);
+    });
+    li.tabIndex = 0;
+    li.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        e.stopPropagation();
+        startInlineRename(doc.path ?? doc, li);
+      }
+    });
     // Press to start a potential drag; activation (setActive) and the actual
     // reorder are decided on pointerup, once we know whether it was a drag. The
     // selection, though, has to settle on press — it decides what gets dragged.
     li.addEventListener('pointerdown', (e) => {
       if (e.button !== 0) return;
+      if (doc.path) lastSelectedSidebarPath = doc.path;
+      li.focus();
       if ((e.target as HTMLElement).closest('.doc-close')) return; // let close work
       e.preventDefault(); // don't begin a text selection as the pointer drags
       let collapse = false;
@@ -1209,8 +1419,9 @@ document.addEventListener('pointerup', (e) => {
       renderSidebar();
     }
     selAnchor = st.doc;
-    setActive(st.doc); // a plain click: just activate
-    focusDocList();
+    setActive(st.doc, { focusEditor: false });
+    const row = docRow.get(st.doc);
+    row?.focus();
     return;
   }
   lastReorderAt = Date.now(); // arm the native-drop guard around this reorder
@@ -1460,6 +1671,24 @@ function appendTreeRows(entry: TreeEntry, depth: number) {
   li.title = entry.path;
   const label = `<span class="tree-name"></span>`;
 
+  if (entry.path && !entry.is_dir) {
+    li.addEventListener('contextmenu', (e) => {
+      showSidebarContextMenu(e, entry.path, li);
+    });
+    li.tabIndex = 0;
+    li.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        e.stopPropagation();
+        startInlineRename(entry.path, li);
+      }
+    });
+  } else if (entry.path && entry.is_dir) {
+    li.addEventListener('contextmenu', (e) => {
+      showSidebarContextMenu(e, entry.path, li);
+    });
+  }
+
   if (entry.is_dir) {
     if (expandedFolders.has(entry.path)) li.classList.add('expanded');
     li.innerHTML = `${TREE_CHEVRON}${TREE_FOLDER}${label}<button type="button" class="tree-copy-btn">${TREE_COPY_ICON}</button>`;
@@ -1479,7 +1708,10 @@ function appendTreeRows(entry: TreeEntry, depth: number) {
     if (entry.path === active?.path) li.classList.add('active');
     li.innerHTML = `<span class="tree-spacer"></span>${TREE_FILE}${label}`;
     li.querySelector('.tree-name')!.textContent = entry.name;
-    li.addEventListener('click', () => openFile(entry.path));
+    li.addEventListener('click', () => {
+      lastSelectedSidebarPath = entry.path;
+      openFile(entry.path);
+    });
     folderTree.appendChild(li);
   }
 }
@@ -1770,9 +2002,9 @@ function scrollEditorToTop(pos: number, settle = true) {
   }
 }
 
-async function setActive(doc: Doc) {
+async function setActive(doc: Doc, opts: { focusEditor?: boolean } = {}) {
   if (active === doc) {
-    if (isEditing) editor.focus();
+    if (opts.focusEditor !== false && isEditing) editor.focus();
     return;
   }
   // Leaving: keep the place we were reading before the pane is rebuilt.
@@ -1803,7 +2035,7 @@ async function setActive(doc: Doc) {
   saveSession();
   restoreScroll(doc);
   updateTemplatePicker();
-  if (isEditing) editor.focus();
+  if (opts.focusEditor !== false && isEditing) editor.focus();
 }
 
 // `recent: false` opens a document without listing it on the start screen —
@@ -2212,6 +2444,7 @@ function applyTemplate(raw: string) {
   // blank page back if this was the wrong template.
   replaceEditorText(text, caret, caret);
   active.workingText = editor.value;
+  updateUntitledName(active);
   updateStatus();
   if (isDirty(active) !== lastActiveDirty) {
     lastActiveDirty = isDirty(active);
@@ -2244,16 +2477,26 @@ function templateFromDoc() {
 }
 
 // Create a new, empty "untitled" document and start editing it.
-function newDoc() {
+function newDoc(initialContent = '') {
   untitledCount++;
-  const name = untitledCount === 1 ? 'untitled' : `untitled ${untitledCount}`;
-  const doc: Doc = { path: null, name, savedSource: '', workingText: '', mtime: 0 };
+  const defaultUntitled = untitledCount === 1 ? 'untitled' : `untitled ${untitledCount}`;
+  const title = deriveTitleFromContent(initialContent);
+  const name = title || defaultUntitled;
+  const doc: Doc = {
+    path: null,
+    name,
+    defaultName: defaultUntitled,
+    customName: false,
+    savedSource: '',
+    workingText: initialContent,
+    mtime: 0,
+  };
   if (active) rememberScroll(active);
   docs.push(doc);
   active = doc;
   lastActiveDirty = false;
-  editor.value = '';
-  renderSource('', '');
+  editor.value = initialContent;
+  renderSource(initialContent, '');
   showDocUI();
   setEditing(true);
   updateStatus();
@@ -2298,11 +2541,19 @@ async function persistTo(path: string) {
   invoke<string[]>('add_recent_file', { path }).then(renderRecent).catch(() => {});
 }
 
-// Default name offered in the save dialog: an untitled doc's first heading,
-// otherwise the current file/buffer name.
+// Default name offered in the save dialog: an untitled doc's explicit name if renamed,
+// otherwise the doc's first heading, or the current file/buffer name.
 function suggestedSaveName(): string {
   if (!active) return 'untitled.md';
   if (active.path) return basename(active.path);
+
+  // If the user explicitly gave a custom name, prioritize that name!
+  if (active.customName && active.name.trim()) {
+    const trimmed = active.name.trim();
+    const hasExt = /\.(md|markdown|txt)$/i.test(trimmed);
+    return hasExt ? sanitizeFilename(trimmed) : `${sanitizeFilename(trimmed)}.md`;
+  }
+
   const title = firstHeadingTitle(active.workingText);
   return `${title ? sanitizeFilename(title) : active.name}.md`;
 }
@@ -2495,7 +2746,7 @@ openBtn.addEventListener('click', async () => {
   if (selected) await openFile(selected as string);
 });
 
-newBtn.addEventListener('click', newDoc);
+newBtn.addEventListener('click', () => newDoc());
 reloadBtn.addEventListener('click', reload);
 saveBtn.addEventListener('click', save);
 deleteBtn.addEventListener('click', deleteActive);
@@ -2508,6 +2759,7 @@ let previewTimer: number | undefined;
 function onEditorInput() {
   if (!active) return;
   active.workingText = editor.value;
+  updateUntitledName(active);
   updateTemplatePicker();
   updateStatus();
   if (isDirty(active) !== lastActiveDirty) {
@@ -5340,6 +5592,41 @@ document.addEventListener('keydown', (e) => {
     e.preventDefault();
     stepActive(e.key === 'ArrowDown' ? 1 : -1);
     return;
+  }
+  // Enter or F2 without modifiers triggers inline rename on the selected sidebar file
+  if ((e.key === 'Enter' || e.key === 'F2') && !isRenaming && !mod && !e.altKey && !e.shiftKey) {
+    const focusedTreeRow = document.activeElement?.closest('.tree-row') as HTMLElement | null;
+    if (focusedTreeRow && focusedTreeRow.title) {
+      e.preventDefault();
+      startInlineRename(focusedTreeRow.title, focusedTreeRow);
+      return;
+    }
+    const focusedDocRow = document.activeElement?.closest('#doc-list li') as HTMLElement | null;
+    if (focusedDocRow) {
+      const doc = rowDoc.get(focusedDocRow);
+      if (doc) {
+        e.preventDefault();
+        startInlineRename(doc.path ?? doc, focusedDocRow);
+        return;
+      }
+    }
+    if (
+      !(document.activeElement instanceof HTMLInputElement) &&
+      !(document.activeElement instanceof HTMLTextAreaElement) &&
+      !editor?.focused
+    ) {
+      const target = lastSelectedSidebarPath || active;
+      const isSidebarOrBody =
+        document.activeElement === document.body ||
+        document.activeElement?.classList.contains('content-area') ||
+        document.activeElement?.classList.contains('preview-area') ||
+        document.getElementById('sidebar')?.contains(document.activeElement);
+      if (target && isSidebarOrBody) {
+        e.preventDefault();
+        startInlineRename(target);
+        return;
+      }
+    }
   }
   if (!mod) return;
   // ⌘⇧F searches every open document; ⌘F searches the one you're reading. Shift

@@ -157,6 +157,28 @@ button:disabled { opacity: 0.3; cursor: default; }
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
 }
 .popup-menu[hidden] { display: none; }
+.context-menu {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: auto;
+  min-width: 160px;
+  z-index: 1000;
+}
+.inline-rename-input {
+  font-family: inherit;
+  font-size: inherit;
+  color: var(--mrd-text);
+  background: var(--mrd-bg);
+  border: 1px solid var(--mrd-accent);
+  border-radius: 4px;
+  padding: 1px 4px;
+  margin: -2px 0;
+  width: 100%;
+  box-sizing: border-box;
+  outline: none;
+}
+
 .popup-item {
   width: 100%;
   justify-content: space-between;
@@ -345,6 +367,13 @@ body.sidebar-hidden #sidebar { display: none; }
   border-left: 2px solid transparent;
 }
 #folder-tree .tree-row:hover { background: var(--mrd-surface); }
+#folder-tree .tree-row:focus,
+#folder-tree .tree-row:focus-visible,
+#doc-list li:focus,
+#doc-list li:focus-visible {
+  outline: 1px solid var(--mrd-accent);
+  outline-offset: -1px;
+}
 #folder-tree .tree-row.active {
   background: var(--mrd-surface-2);
   color: var(--mrd-text);
