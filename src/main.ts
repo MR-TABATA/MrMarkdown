@@ -256,6 +256,8 @@ interface Doc {
    * they do.
    */
   conflict?: { content: string; mtime: number } | null;
+  /** True when the file was removed or moved on disk while open in memory. */
+  deletedOnDisk?: boolean;
 }
 
 let docs: Doc[] = [];
@@ -961,6 +963,16 @@ function updateStatus() {
     statusPath.appendChild(dot);
   }
   statusPath.append(active.path ? tildify(active.path, home) : active.name);
+  if (active.deletedOnDisk) {
+    const delMsg = document.createElement('span');
+    delMsg.className = 'deleted-tag';
+    delMsg.style.color = 'var(--text-muted, #888)';
+    delMsg.style.marginLeft = '8px';
+    delMsg.textContent = t('deletedOnDisk');
+    statusPath.appendChild(delMsg);
+    saveBtn.disabled = false;
+    saveBtn.classList.toggle('dirty', true);
+  }
 }
 
 // Reading mode: hide every piece of chrome (toolbar, sidebar, outline) and
@@ -1327,6 +1339,9 @@ async function loadFolder(root: string, expanded: string[] = []) {
   for (const p of expanded) expandedFolders.add(p);
   updateFolderHeader();
   renderTree();
+  await invoke('watch_folder', { path: root }).catch((err) => {
+    console.error('Failed to watch folder:', err);
+  });
 }
 
 /**
@@ -1353,6 +1368,9 @@ async function refreshFolderTree(reveal?: string) {
 }
 
 function closeFolder() {
+  invoke('unwatch_folder').catch((err) => {
+    console.error('Failed to unwatch folder:', err);
+  });
   folderRoot = null;
   expandedFolders.clear();
   treeChildren.clear();
@@ -2272,6 +2290,7 @@ async function persistTo(path: string) {
   active.name = basename(path);
   active.savedSource = active.workingText;
   active.mtime = await invoke<number>('file_mtime', { path }).catch(() => 0);
+  active.deletedOnDisk = false;
   lastActiveDirty = false;
   updateStatus();
   renderSidebar();
@@ -2358,8 +2377,13 @@ async function refreshActiveFromDisk(preserveScroll: boolean, external = false) 
 
 // Re-read from disk, but never silently discard unsaved edits.
 async function reload() {
-  if (!active || !active.path || isDirty(active)) return;
-  await refreshActiveFromDisk(true);
+  if (active && active.path && !isDirty(active)) {
+    await refreshActiveFromDisk(true);
+  }
+  if (folderRoot) {
+    await refreshFolderTree();
+  }
+  renderSidebar();
 }
 
 // --- Conflict: the file changed on disk while we held unsaved edits ----------
@@ -5517,6 +5541,62 @@ getCurrentWebview().onDragDropEvent((event) => {
   }
 });
 
+// Watch folder tree and active document changes via notify FSEvents
+let fsChangeTimer: number | undefined;
+let isProcessingFsChange = false;
+let pendingFsChange = false;
+
+async function handleFsChange() {
+  if (isProcessingFsChange) {
+    pendingFsChange = true;
+    return;
+  }
+  isProcessingFsChange = true;
+  try {
+    if (folderRoot) {
+      try {
+        await refreshFolderTree();
+      } catch (err) {
+        console.error('Failed to refresh folder tree:', err);
+      }
+    }
+    if (active?.path) {
+      try {
+        const m = await invoke<number>('file_mtime', { path: active.path });
+        if (active.deletedOnDisk) {
+          active.deletedOnDisk = false;
+          updateStatus();
+        }
+        if (m > active.mtime) {
+          if (!isDirty(active) && !isEditing) {
+            await refreshActiveFromDisk(true, true);
+          } else {
+            await noteDiskChange(active, m);
+          }
+        }
+      } catch (err) {
+        // file might have been deleted or moved
+        if (!active.deletedOnDisk) {
+          active.deletedOnDisk = true;
+          updateStatus();
+        }
+      }
+    }
+  } finally {
+    isProcessingFsChange = false;
+    if (pendingFsChange) {
+      pendingFsChange = false;
+      clearTimeout(fsChangeTimer);
+      fsChangeTimer = window.setTimeout(handleFsChange, 200);
+    }
+  }
+}
+
+listen('fs-change', () => {
+  clearTimeout(fsChangeTimer);
+  fsChangeTimer = window.setTimeout(handleFsChange, 200);
+});
+
 // Watch the active file on disk. With nothing in flight we just re-render the
 // new content. With unsaved edits — or with the editor open — we can't: the file
 // and the buffer have diverged, and picking a winner is the user's call, so it
@@ -5526,6 +5606,10 @@ setInterval(async () => {
   if (!doc?.path) return;
   try {
     const m = await invoke<number>('file_mtime', { path: doc.path });
+    if (doc.deletedOnDisk) {
+      doc.deletedOnDisk = false;
+      updateStatus();
+    }
     if (m <= doc.mtime) return;
     // Nothing of ours is in flight, so just take the new content — but keep it,
     // and what it replaced, in the timeline. "What did the AI change?" is only
@@ -5534,6 +5618,10 @@ setInterval(async () => {
     else await noteDiskChange(doc, m);
   } catch {
     // File may have been moved/removed; leave the last render in place.
+    if (!doc.deletedOnDisk) {
+      doc.deletedOnDisk = true;
+      updateStatus();
+    }
   }
 }, 700);
 

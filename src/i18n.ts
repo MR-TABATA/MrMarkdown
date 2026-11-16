@@ -295,6 +295,7 @@ const DICT = {
     folderTreeLargeConfirm: '{n} 件あります。node_modules など大きなフォルダが含まれていないか確認してください。',
     folderTreeLargeOk: 'コピーする',
     closeConfirm: '「{name}」は未保存です。閉じますか？',
+    deletedOnDisk: '（ディスク上で削除されました）',
   },
   en: {
     btnSidebar: 'Documents (⌘1)',
@@ -569,6 +570,7 @@ const DICT = {
     folderTreeLargeConfirm: 'This includes {n} entries. Check whether a large folder like node_modules got pulled in.',
     folderTreeLargeOk: 'Copy anyway',
     closeConfirm: '“{name}” has unsaved changes. Close it?',
+    deletedOnDisk: '(deleted on disk)',
   },
 } as const;
 

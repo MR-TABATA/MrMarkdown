@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
+use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use tauri::menu::{AboutMetadata, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::{Emitter, Manager};
 
@@ -42,6 +43,93 @@ struct PendingFile(Mutex<Option<String>>);
 /// language switch has to come back in the same state.
 #[derive(Default)]
 struct DocOpen(AtomicBool);
+
+struct WatcherHandle {
+    _watcher: RecommendedWatcher,
+    watched_path: String,
+}
+
+#[derive(Default)]
+struct FolderWatcher(Mutex<Option<WatcherHandle>>);
+
+/// Check if a path should be ignored by the file watcher (version control,
+/// dependency folders, editor temp files, etc. matching spec-file-watch.md).
+fn is_noise_path(path: &std::path::Path) -> bool {
+    let has_ignored_component = path.components().any(|c| {
+        let s = c.as_os_str().to_string_lossy();
+        s == ".git"
+            || s == "node_modules"
+            || s == ".DS_Store"
+            || s == "target"
+            || s == ".build"
+            || s == ".claude"
+    });
+    if has_ignored_component {
+        return true;
+    }
+
+    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        if name.ends_with('~') || name.ends_with(".tmp") || name.ends_with(".swp") || name.ends_with(".swo") {
+            return true;
+        }
+    }
+    false
+}
+
+#[tauri::command]
+fn watch_folder(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    let state = app.state::<FolderWatcher>();
+    let mut guard = state.0.lock().map_err(|e| e.to_string())?;
+
+    if let Some(ref handle) = *guard {
+        if handle.watched_path == path {
+            return Ok(());
+        }
+    }
+
+    let p = std::path::Path::new(&path);
+    if !p.is_dir() {
+        return Err("Not a directory".to_string());
+    }
+
+    let app_clone = app.clone();
+    let mut watcher = RecommendedWatcher::new(
+        move |res: Result<Event, notify::Error>| match res {
+            Ok(event) => {
+                let is_noise = event.paths.iter().any(|p| is_noise_path(p));
+                if !is_noise {
+                    if let Err(e) = app_clone.emit("fs-change", ()) {
+                        eprintln!("Failed to emit fs-change: {e}");
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Watcher error: {e}");
+            }
+        },
+        Config::default(),
+    )
+    .map_err(|e| e.to_string())?;
+
+    watcher
+        .watch(p, RecursiveMode::Recursive)
+        .map_err(|e| e.to_string())?;
+
+    *guard = Some(WatcherHandle {
+        _watcher: watcher,
+        watched_path: path,
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+fn unwatch_folder(app: tauri::AppHandle) -> Result<(), String> {
+    let state = app.state::<FolderWatcher>();
+    let mut guard = state.0.lock().map_err(|e| e.to_string())?;
+    *guard = None;
+    Ok(())
+}
 
 fn is_supported(path: &str) -> bool {
     std::path::Path::new(path)
@@ -904,8 +992,10 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(PendingFile::default())
         .manage(DocOpen::default())
+        .manage(FolderWatcher::default())
         .invoke_handler(tauri::generate_handler![convert_file,
-            
+            watch_folder,
+            unwatch_folder,
             read_file,
             save_file,
             save_image,
@@ -1371,5 +1461,27 @@ mod tests {
         // because pruning never looks outside the kind being written.
         let saves: Vec<u64> = (0..Kind::Save.budget() as u64).rev().collect();
         assert!(prune_ids(&saves, Kind::Save.budget()).is_empty());
+    }
+
+    #[test]
+    fn is_noise_path_filters_ignored_components_and_temp_files() {
+        use std::path::Path;
+
+        assert!(is_noise_path(Path::new("/repo/.git/HEAD")));
+        assert!(is_noise_path(Path::new("/repo/node_modules/foo/package.json")));
+        assert!(is_noise_path(Path::new("/repo/target/debug/mrdown")));
+        assert!(is_noise_path(Path::new("/repo/.build/tmp")));
+        assert!(is_noise_path(Path::new("/repo/.claude/settings.json")));
+        assert!(is_noise_path(Path::new("/repo/.DS_Store")));
+        assert!(is_noise_path(Path::new("/repo/sub/.DS_Store")));
+
+        assert!(is_noise_path(Path::new("/repo/test.md~")));
+        assert!(is_noise_path(Path::new("/repo/sub/test.tmp")));
+        assert!(is_noise_path(Path::new("/repo/.test.swp")));
+        assert!(is_noise_path(Path::new("/repo/.test.swo")));
+
+        assert!(!is_noise_path(Path::new("/repo/notes/spec.md")));
+        assert!(!is_noise_path(Path::new("/repo/src/main.ts")));
+        assert!(!is_noise_path(Path::new("/repo/README.md")));
     }
 }
