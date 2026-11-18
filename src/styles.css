@@ -542,13 +542,15 @@ body.outline-right .outline-item.active { background: var(--mrd-surface-2); }
   cursor: col-resize;
   transition: background 0.15s ease, box-shadow 0.15s ease;
 }
+/* The grab zone leans to the right only: the column on the left ends in its own
+   scrollbar, and a zone reaching over it would swallow the clicks meant for it. */
 .pane-resizer::before {
   content: '';
   position: absolute;
   top: 0;
   bottom: 0;
-  left: -5px;
-  right: -5px;
+  left: 0;
+  right: -6px;
 }
 .pane-resizer:hover,
 .pane-resizer.resizing {
@@ -881,8 +883,8 @@ mark.find-hit-current { background: var(--mrd-hit-current); color: var(--mrd-hit
   position: absolute;
   top: 0;
   bottom: 0;
-  left: -5px;
-  right: -5px;
+  left: 0; /* not over the editor's scrollbar — see .pane-resizer::before */
+  right: -6px;
 }
 .content-area.editing #divider:hover,
 .content-area.editing.resizing #divider {
@@ -1813,9 +1815,17 @@ body.has-doc #output { display: block; }
   cursor: pointer;
 }
 
-::-webkit-scrollbar { width: 6px; }
+/* 10px to grab, 6px to see: the transparent border widens the target without
+   thickening the thumb. */
+::-webkit-scrollbar { width: 10px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: var(--mrd-border); border-radius: 3px; }
+::-webkit-scrollbar-thumb {
+  background: var(--mrd-border);
+  background-clip: padding-box;
+  border: 2px solid transparent;
+  border-radius: 5px;
+}
+::-webkit-scrollbar-thumb:hover { background: var(--mrd-muted); background-clip: padding-box; }
 
 /* --- Print / PDF export ----------------------------------------------------
    File ▸ Export as PDF… opens the platform print dialog, which renders this
