@@ -40,3 +40,6 @@ demo/out/
 
 # Claude Code へのローカル指示（各自の手元のもの。共有しない）
 CLAUDE.md
+
+# 開発ビルドを実データから隔離して起動するための置き場（HOME と試験用フォルダ）
+/.dev-sandbox/

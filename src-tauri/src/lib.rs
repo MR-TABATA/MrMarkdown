@@ -46,11 +46,10 @@ struct DocOpen(AtomicBool);
 
 struct WatcherHandle {
     _watcher: RecommendedWatcher,
-    watched_path: String,
 }
 
 #[derive(Default)]
-struct FolderWatcher(Mutex<Option<WatcherHandle>>);
+struct FolderWatcher(Mutex<std::collections::HashMap<String, WatcherHandle>>);
 
 /// Check if a path should be ignored by the file watcher (version control,
 /// dependency folders, editor temp files, etc. matching spec-file-watch.md).
@@ -81,10 +80,8 @@ fn watch_folder(app: tauri::AppHandle, path: String) -> Result<(), String> {
     let state = app.state::<FolderWatcher>();
     let mut guard = state.0.lock().map_err(|e| e.to_string())?;
 
-    if let Some(ref handle) = *guard {
-        if handle.watched_path == path {
-            return Ok(());
-        }
+    if guard.contains_key(&path) {
+        return Ok(());
     }
 
     let p = std::path::Path::new(&path);
@@ -115,19 +112,21 @@ fn watch_folder(app: tauri::AppHandle, path: String) -> Result<(), String> {
         .watch(p, RecursiveMode::Recursive)
         .map_err(|e| e.to_string())?;
 
-    *guard = Some(WatcherHandle {
-        _watcher: watcher,
-        watched_path: path,
-    });
+    guard.insert(path, WatcherHandle { _watcher: watcher });
 
     Ok(())
 }
 
 #[tauri::command]
-fn unwatch_folder(app: tauri::AppHandle) -> Result<(), String> {
+fn unwatch_folder(app: tauri::AppHandle, path: Option<String>) -> Result<(), String> {
     let state = app.state::<FolderWatcher>();
     let mut guard = state.0.lock().map_err(|e| e.to_string())?;
-    *guard = None;
+    match path {
+        Some(p) => {
+            guard.remove(&p);
+        }
+        None => guard.clear(),
+    }
     Ok(())
 }
 

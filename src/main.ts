@@ -218,10 +218,6 @@ homeDir()
 const docList = document.getElementById('doc-list')!;
 const folderBtn = document.getElementById('folder-btn')!;
 const folderTree = document.getElementById('folder-tree') as HTMLElement;
-const folderHead = document.getElementById('folder-head') as HTMLElement;
-const folderName = document.getElementById('folder-name')!;
-const folderTreeCopyBtn = document.getElementById('folder-tree-copy-btn') as HTMLButtonElement;
-const folderCloseBtn = document.getElementById('folder-close-btn') as HTMLButtonElement;
 const contentArea = document.querySelector('.content-area') as HTMLElement;
 const sidebarContextMenu = document.getElementById('sidebar-context-menu') as HTMLElement;
 const sidebarCtxRename = document.getElementById('sidebar-ctx-rename') as HTMLButtonElement;
@@ -339,7 +335,7 @@ function startInlineRename(target: string | Doc, rowEl?: HTMLElement) {
     if (matchingDocs.length > 0) {
       renderSidebar();
     }
-    if (folderRoot) {
+    if (folderRoots.length > 0) {
       try {
         await refreshFolderTree();
       } catch (err) {
@@ -1514,11 +1510,24 @@ interface TreeEntry {
 }
 
 const FOLDER_KEY = 'mrdown.folder';
-let folderRoot: string | null = null;
+// Every folder the user has opened, in the order opened. Opening another adds to
+// the list; only its own close button removes one.
+const folderRoots: string[] = [];
 // Expanded subfolders (by absolute path) and a cache of each listed directory's
 // children, so re-rendering the tree never re-hits the disk.
 const expandedFolders = new Set<string>();
 const treeChildren = new Map<string, TreeEntry[]>();
+
+/** The open folder that contains `path` (the deepest one, if they nest). */
+function rootOf(path: string): string | null {
+  let best: string | null = null;
+  for (const r of folderRoots) {
+    if (path === r || path.startsWith(r + '/') || path.startsWith(r + '\\')) {
+      if (!best || r.length > best.length) best = r;
+    }
+  }
+  return best;
+}
 
 const listDir = (dir: string) => invoke<TreeEntry[]>('read_dir', { dir }).catch(() => []);
 // Same as read_dir but unfiltered — for the folder-tree text export, which
@@ -1526,29 +1535,27 @@ const listDir = (dir: string) => invoke<TreeEntry[]>('read_dir', { dir }).catch(
 const listDirAll = (dir: string) => invoke<TreeEntry[]>('read_dir_all', { dir }).catch(() => []);
 
 function saveFolderState() {
-  if (!folderRoot) {
+  if (folderRoots.length === 0) {
     localStorage.removeItem(FOLDER_KEY);
     return;
   }
   try {
     localStorage.setItem(
       FOLDER_KEY,
-      JSON.stringify({ root: folderRoot, expanded: [...expandedFolders] }),
+      JSON.stringify({ roots: [...folderRoots], expanded: [...expandedFolders] }),
     );
   } catch {
     // Non-fatal: a lost folder state just means the tree starts collapsed.
   }
 }
 
-// Open (or restore) a folder as the tree root. Fetches the root listing plus any
-// still-expanded subfolders up front so the restored tree renders in one pass.
+// Add a folder to the tree (or, if it is already open, re-read it). Fetches its
+// root listing plus any still-expanded subfolders up front so a restored tree
+// renders in one pass. Other open folders are left alone.
 async function loadFolder(root: string, expanded: string[] = []) {
-  folderRoot = root;
-  expandedFolders.clear();
-  treeChildren.clear();
-  await Promise.all([root, ...expanded].map(async (d) => treeChildren.set(d, await listDir(d))));
+  if (!folderRoots.includes(root)) folderRoots.push(root);
   for (const p of expanded) expandedFolders.add(p);
-  updateFolderHeader();
+  await Promise.all([root, ...expanded].map(async (d) => treeChildren.set(d, await listDir(d))));
   renderTree();
   await invoke('watch_folder', { path: root }).catch((err) => {
     console.error('Failed to watch folder:', err);
@@ -1556,48 +1563,52 @@ async function loadFolder(root: string, expanded: string[] = []) {
 }
 
 /**
- * Re-read the open folder from disk, keeping what was expanded. The tree caches
- * every listing it has made, so anything this app writes into the folder itself
+ * Re-read every open folder from disk, keeping what was expanded. The tree caches
+ * every listing it has made, so anything this app writes into a folder itself
  * stays invisible until something asks for it again.
  *
  * `reveal` expands the path down to a folder that was just created, so it can be
  * seen rather than merely existing.
  */
 async function refreshFolderTree(reveal?: string) {
-  if (!folderRoot) return;
-  const expanded = [...expandedFolders];
-  if (reveal?.startsWith(folderRoot)) {
-    const sep = folderRoot.includes('\\') ? '\\' : '/';
-    let path = folderRoot;
-    for (const part of reveal.slice(folderRoot.length).split(/[/\\]/).filter(Boolean)) {
+  if (folderRoots.length === 0) return;
+  const expanded = new Set(expandedFolders);
+  const revealRoot = reveal ? rootOf(reveal) : null;
+  if (reveal && revealRoot) {
+    const sep = revealRoot.includes('\\') ? '\\' : '/';
+    let path = revealRoot;
+    for (const part of reveal.slice(revealRoot.length).split(/[/\\]/).filter(Boolean)) {
       path += sep + part;
-      if (!expanded.includes(path)) expanded.push(path);
+      expanded.add(path);
     }
   }
-  await loadFolder(folderRoot, expanded);
-  saveFolderState();
-}
-
-function closeFolder() {
-  invoke('unwatch_folder').catch((err) => {
-    console.error('Failed to unwatch folder:', err);
-  });
-  folderRoot = null;
-  expandedFolders.clear();
+  const dirs = [...new Set([...folderRoots, ...expanded])];
+  const listed = await Promise.all(dirs.map(async (d) => [d, await listDir(d)] as const));
   treeChildren.clear();
-  updateFolderHeader();
+  for (const [d, entries] of listed) treeChildren.set(d, entries);
+  expandedFolders.clear();
+  for (const p of expanded) expandedFolders.add(p);
   renderTree();
   saveFolderState();
 }
 
-function updateFolderHeader() {
-  // The header (folder name + close) only exists while a folder is open; opening
-  // is driven by the labeled toolbar button, so there's nothing to show when none.
-  folderHead.hidden = !folderRoot;
-  if (folderRoot) {
-    folderName.textContent = basename(folderRoot);
-    folderName.title = folderRoot;
+function closeFolder(root: string) {
+  const i = folderRoots.indexOf(root);
+  if (i < 0) return;
+  folderRoots.splice(i, 1);
+  invoke('unwatch_folder', { path: root }).catch((err) => {
+    console.error('Failed to unwatch folder:', err);
+  });
+  // Forget what was cached/expanded under it — unless another open folder still
+  // contains it (nested roots).
+  for (const p of [...treeChildren.keys(), ...expandedFolders]) {
+    if ((p === root || p.startsWith(root + '/') || p.startsWith(root + '\\')) && !rootOf(p)) {
+      treeChildren.delete(p);
+      expandedFolders.delete(p);
+    }
   }
+  renderTree();
+  saveFolderState();
 }
 
 async function toggleFolder(path: string) {
@@ -1651,17 +1662,39 @@ async function copyFolderTree(path: string, btn: HTMLElement) {
 // recurse, so collapsed branches cost nothing.
 function renderTree() {
   folderTree.innerHTML = '';
-  folderTree.hidden = !folderRoot;
-  if (!folderRoot) return;
-  const roots = treeChildren.get(folderRoot) ?? [];
-  if (roots.length === 0) {
-    const li = document.createElement('li');
-    li.className = 'tree-empty';
-    li.textContent = t('folderEmpty');
-    folderTree.appendChild(li);
-    return;
+  folderTree.hidden = folderRoots.length === 0;
+  for (const root of folderRoots) {
+    appendRootHeader(root);
+    const entries = treeChildren.get(root) ?? [];
+    if (entries.length === 0) {
+      const li = document.createElement('li');
+      li.className = 'tree-empty';
+      li.textContent = t('folderEmpty');
+      folderTree.appendChild(li);
+      continue;
+    }
+    for (const entry of entries) appendTreeRows(entry, 0);
   }
-  for (const entry of roots) appendTreeRows(entry, 0);
+}
+
+// One header per open folder: its name, a copy-as-text button and a close button.
+function appendRootHeader(root: string) {
+  const li = document.createElement('li');
+  li.className = 'sidebar-title folder-head tree-root';
+  li.title = root;
+  li.innerHTML =
+    '<svg class="folder-head-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7a2 2 0 0 1 2-2h4l2 3h8a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>' +
+    '<span class="folder-name"></span>' +
+    `<button type="button" class="folder-btn folder-copy">${TREE_COPY_ICON}</button>` +
+    '<button type="button" class="folder-btn folder-close"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"><line x1="6" y1="6" x2="18" y2="18"/><line x1="18" y1="6" x2="6" y2="18"/></svg></button>';
+  li.querySelector('.folder-name')!.textContent = basename(root);
+  const copyBtn = li.querySelector('.folder-copy') as HTMLButtonElement;
+  copyBtn.title = t('folderTreeCopy');
+  copyBtn.addEventListener('click', () => copyFolderTree(root, copyBtn));
+  const closeBtn = li.querySelector('.folder-close') as HTMLButtonElement;
+  closeBtn.title = t('folderClose');
+  closeBtn.addEventListener('click', () => closeFolder(root));
+  folderTree.appendChild(li);
 }
 
 function appendTreeRows(entry: TreeEntry, depth: number) {
@@ -1746,11 +1779,6 @@ async function folderTreeAsText(root: string): Promise<{ text: string; count: nu
   return { text: lines.join('\n'), count: lines.length - 1 };
 }
 
-folderTreeCopyBtn.addEventListener('click', async () => {
-  if (!folderRoot) return;
-  await copyFolderTree(folderRoot, folderTreeCopyBtn);
-});
-
 folderBtn.addEventListener('click', async () => {
   const dir = await open({ directory: true, multiple: false });
   if (typeof dir === 'string') {
@@ -1758,16 +1786,21 @@ folderBtn.addEventListener('click', async () => {
     saveFolderState();
   }
 });
-folderCloseBtn.addEventListener('click', closeFolder);
 
 // Restore a previously opened folder tree on startup.
 try {
   const raw = localStorage.getItem(FOLDER_KEY);
   if (raw) {
-    const saved = JSON.parse(raw) as { root?: unknown; expanded?: unknown };
-    if (typeof saved.root === 'string') {
-      loadFolder(saved.root, Array.isArray(saved.expanded) ? (saved.expanded as string[]) : []);
-    }
+    // `root` is the single-folder format of earlier versions.
+    const saved = JSON.parse(raw) as { roots?: unknown; root?: unknown; expanded?: unknown };
+    const roots = Array.isArray(saved.roots)
+      ? (saved.roots as unknown[]).filter((r): r is string => typeof r === 'string')
+      : typeof saved.root === 'string' ? [saved.root] : [];
+    const expanded = Array.isArray(saved.expanded) ? (saved.expanded as string[]) : [];
+    // Sequential, so roots keep the order they were opened in.
+    void (async () => {
+      for (const r of roots) await loadFolder(r, expanded.filter((p) => rootOf(p) === r || p === r || p.startsWith(r + '/') || p.startsWith(r + '\\')));
+    })();
   }
 } catch {
   // Corrupt folder state: ignore and start with no tree.
@@ -2209,9 +2242,10 @@ const templateFolderOverride = () => localStorage.getItem(TEMPLATE_FOLDER_KEY);
 
 /** `docs/_templates` inside the folder currently open, if one is. */
 function repoTemplateDir(): string | null {
-  if (!folderRoot) return null;
-  const sep = folderRoot.includes('\\') ? '\\' : '/';
-  return `${folderRoot}${sep}${TEMPLATE_DIR_IN_REPO.split('/').join(sep)}`;
+  const root = (active?.path ? rootOf(active.path) : null) ?? folderRoots[0];
+  if (!root) return null;
+  const sep = root.includes('\\') ? '\\' : '/';
+  return `${root}${sep}${TEMPLATE_DIR_IN_REPO.split('/').join(sep)}`;
 }
 
 /**
@@ -2373,8 +2407,9 @@ async function buildTemplateFolderOption(message?: string) {
     forAgents.addEventListener('click', async () => {
       // Relative to the repository when it sits inside it, since that is how the
       // file being pasted into will be read.
-      const shown = folderRoot && source.dir.startsWith(folderRoot)
-        ? source.dir.slice(folderRoot.length).replace(/^[/\\]/, '')
+      const srcRoot = folderRoots.find((r) => source.dir.startsWith(r));
+      const shown = srcRoot
+        ? source.dir.slice(srcRoot.length).replace(/^[/\\]/, '')
         : tildify(source.dir, home);
       status.textContent = (await copyText(agentInstructions(shown, getLang())))
         ? t('templateForAgentsCopied')
@@ -2631,7 +2666,7 @@ async function reload() {
   if (active && active.path && !isDirty(active)) {
     await refreshActiveFromDisk(true);
   }
-  if (folderRoot) {
+  if (folderRoots.length > 0) {
     await refreshFolderTree();
   }
   renderSidebar();
@@ -4045,7 +4080,7 @@ function applyI18n() {
   editLabel.textContent = isEditing ? t('preview') : t('edit');
   updateStatus();
   if (active) renderSidebar();
-  updateFolderHeader();
+  renderTree();
   buildToolbarOptions();
   buildLangOptions();
   buildAppearanceOptions();
@@ -5840,7 +5875,7 @@ async function handleFsChange() {
   }
   isProcessingFsChange = true;
   try {
-    if (folderRoot) {
+    if (folderRoots.length > 0) {
       try {
         await refreshFolderTree();
       } catch (err) {
