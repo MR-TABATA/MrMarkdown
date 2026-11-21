@@ -28,6 +28,13 @@ import {
   calloutExtension,
 } from './markdown';
 import {
+  SheetStore,
+  type Sheet,
+  type StoredSheet,
+  type StoredSessionWithSheets,
+  generateSheetId,
+} from './sheets';
+import {
   docTemplate,
   fillTemplate,
   toTemplateSkeleton,
@@ -218,6 +225,8 @@ homeDir()
 const docList = document.getElementById('doc-list')!;
 const folderBtn = document.getElementById('folder-btn')!;
 const folderTree = document.getElementById('folder-tree') as HTMLElement;
+const sheetTabs = document.getElementById('sheet-tabs') as HTMLElement;
+const sheetAddBtn = document.getElementById('sheet-add-btn') as HTMLElement;
 const contentArea = document.querySelector('.content-area') as HTMLElement;
 const sidebarContextMenu = document.getElementById('sidebar-context-menu') as HTMLElement;
 const sidebarCtxRename = document.getElementById('sidebar-ctx-rename') as HTMLButtonElement;
@@ -454,6 +463,7 @@ interface Doc {
 }
 
 let docs: Doc[] = [];
+let sheetStore = new SheetStore<Doc>();
 // Pointer-drag state for reordering the open-docs sidebar. HTML5 drag-and-drop
 // can't be used here: Tauri owns native drag/drop on the window (to open files
 // dropped onto it), which suppresses in-page DnD in the macOS WKWebView. Pointer
@@ -462,6 +472,7 @@ let docs: Doc[] = [];
 // kept (so the whole block can be dragged) and collapses on release if it turns
 // out to have been a plain click.
 let dragState: { doc: Doc; startY: number; moved: boolean; collapse: boolean } | null = null;
+let sheetTabDragState: { sheetId: string; name: string; startX: number; startY: number; moved: boolean; pointerId: number; tab: HTMLElement } | null = null;
 const rowDoc = new WeakMap<HTMLElement, Doc>();
 // The row showing each document, so a gesture can reach rows other than the one
 // under the pointer (the rest of a multi-selection) and survive a re-render.
@@ -1245,6 +1256,200 @@ function setEditing(on: boolean) {
   if (!findBar.hidden) runFind();
 }
 
+// --- Sheets (Workspaces) ---
+
+async function setFolderRootsForSheet(roots: string[], expanded: string[] = []) {
+  if (
+    roots.length === folderRoots.length &&
+    roots.every((r, i) => r === folderRoots[i])
+  ) {
+    return;
+  }
+
+  for (const r of folderRoots) {
+    await invoke('unwatch_folder', { path: r }).catch(() => {});
+  }
+  treeChildren.clear();
+  expandedFolders.clear();
+  folderRoots.splice(0, folderRoots.length);
+
+  const results = await Promise.allSettled(
+    roots.map((r) =>
+      loadFolder(
+        r,
+        expanded.filter((p) => rootOf(p) === r || p === r || p.startsWith(r + '/') || p.startsWith(r + '\\'))
+      )
+    )
+  );
+
+  for (let i = 0; i < roots.length; i++) {
+    const r = roots[i];
+    if (results[i].status === 'rejected') {
+      console.warn(`Failed to load folder: ${r}`, (results[i] as PromiseRejectedResult).reason);
+      if (!folderRoots.includes(r)) folderRoots.push(r);
+    }
+  }
+
+  if (folderRoots.length === 0) {
+    folderTree.hidden = true;
+    folderTree.innerHTML = '';
+  }
+}
+
+function renderSheetBar() {
+  if (!sheetTabs) return;
+  sheetTabs.innerHTML = '';
+  const currentActiveId = sheetStore.activeSheetId;
+
+  for (const sheet of sheetStore.sheets) {
+    const tab = document.createElement('div');
+    tab.className = 'sheet-tab' + (sheet.id === currentActiveId ? ' active' : '');
+    tab.dataset.sheetId = sheet.id;
+    tab.setAttribute('role', 'tab');
+    tab.setAttribute('aria-selected', sheet.id === currentActiveId ? 'true' : 'false');
+
+    const nameSpan = document.createElement('span');
+    nameSpan.className = 'sheet-tab-name';
+    nameSpan.textContent = sheet.name;
+    tab.appendChild(nameSpan);
+
+    // Double-click to rename inline
+    nameSpan.addEventListener('dblclick', (e) => {
+      e.stopPropagation();
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.className = 'sheet-tab-input';
+      input.value = sheet.name;
+      tab.replaceChild(input, nameSpan);
+      input.focus();
+      input.select();
+
+      const commit = () => {
+        const newName = input.value.trim();
+        if (newName && newName !== sheet.name) {
+          sheetStore.renameSheet(sheet.id, newName);
+          saveSession();
+        }
+        renderSheetBar();
+      };
+
+      input.addEventListener('blur', commit);
+      input.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Enter') {
+          ev.preventDefault();
+          commit();
+        } else if (ev.key === 'Escape') {
+          ev.preventDefault();
+          renderSheetBar();
+        }
+      });
+    });
+
+    // Close button (only when more than 1 sheet exists)
+    if (sheetStore.sheets.length > 1) {
+      const closeBtn = document.createElement('button');
+      closeBtn.className = 'sheet-tab-close';
+      closeBtn.setAttribute('aria-label', t('deleteSheet'));
+      closeBtn.setAttribute('title', t('deleteSheet'));
+      closeBtn.innerHTML = '<svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
+      closeBtn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        if (sheet.docs.length > 0) {
+          const ok = await confirmDialog(t('closeConfirm', { name: sheet.name }));
+          if (!ok) return;
+        }
+        const isCurrent = sheet.id === sheetStore.activeSheetId;
+        sheetStore.removeSheet(sheet.id);
+        if (isCurrent) {
+          await switchSheet(sheetStore.activeSheetId, { force: true, skipSyncCur: true });
+        } else {
+          renderSheetBar();
+          saveSession();
+        }
+      });
+      tab.appendChild(closeBtn);
+    }
+
+    tab.addEventListener('click', (e) => {
+      // Handled via pointerup
+      e.preventDefault();
+    });
+
+    // Sheet tab reordering by Pointer Events (Drag & Drop)
+    tab.addEventListener('pointerdown', (e) => {
+      if ((e.target as HTMLElement)?.closest('.sheet-tab-input, .sheet-tab-close')) return;
+      if (e.button !== 0) return;
+      e.preventDefault(); // Prevent WebKit text selection / pointercancel
+      try {
+        tab.setPointerCapture(e.pointerId);
+      } catch {}
+      sheetTabDragState = {
+        sheetId: sheet.id,
+        name: sheet.name,
+        startX: e.clientX,
+        startY: e.clientY,
+        moved: false,
+        pointerId: e.pointerId,
+        tab,
+      };
+    });
+
+    sheetTabs.appendChild(tab);
+  }
+}
+
+async function switchSheet(sheetId: string, opts: { force?: boolean; skipSyncCur?: boolean } = {}) {
+  if (!opts.force && sheetId === sheetStore.activeSheetId) return;
+
+  // 1. Sync current state into the current active sheet unless explicitly skipped
+  if (!opts.skipSyncCur) {
+    const curSheet = sheetStore.activeSheet;
+    if (curSheet && curSheet.id !== sheetId) {
+      curSheet.docs = [...docs];
+      curSheet.activeId = active ? (active.path || active.name) : null;
+      curSheet.folderRoots = [...folderRoots];
+      curSheet.expandedFolders = [...expandedFolders];
+    }
+  }
+
+  // 2. Set active sheet in store
+  sheetStore.setActiveSheet(sheetId);
+  const nextSheet = sheetStore.activeSheet;
+  if (!nextSheet) return;
+
+  try {
+    // 3. Load documents of next sheet
+    docs = nextSheet.docs;
+
+    // 4. Load folders of next sheet
+    await setFolderRootsForSheet(nextSheet.folderRoots, nextSheet.expandedFolders);
+
+    // 5. Update sidebar document list
+    renderSidebar();
+
+    // 6. Restore active document
+    let targetDoc = docs.find((d) => (d.path || d.name) === nextSheet.activeId) || docs[0] || null;
+    if (targetDoc) {
+      await setActive(targetDoc);
+    } else {
+      newDoc();
+    }
+  } catch (err) {
+    console.error('Error during sheet switch:', err);
+    renderSidebar();
+  }
+
+  // 7. Update sheet bar UI
+  renderSheetBar();
+  saveSession();
+}
+
+sheetAddBtn?.addEventListener('click', () => {
+  const newSheet = sheetStore.addSheet();
+  renderSheetBar();
+  void switchSheet(newSheet.id);
+});
+
 // --- Sidebar (open documents) ---
 
 function renderSidebar() {
@@ -1369,6 +1574,7 @@ function focusDocList() {
 
 function clearDropMarks() {
   docList.querySelectorAll('li').forEach((el) => el.classList.remove('drop-before', 'drop-after'));
+  document.querySelectorAll('.sheet-tab').forEach((el) => el.classList.remove('drag-over', 'sheet-dragging', 'drop-before', 'drop-after'));
 }
 // The sidebar row currently under the pointer, if any.
 function rowUnder(x: number, y: number): HTMLElement | null {
@@ -1376,17 +1582,175 @@ function rowUnder(x: number, y: number): HTMLElement | null {
   return el ? el.closest<HTMLElement>('#doc-list li') : null;
 }
 
+// The sheet tab currently under the pointer, if any.
+function sheetTabUnder(x: number, y: number): HTMLElement | null {
+  const el = document.elementFromPoint(x, y) as HTMLElement | null;
+  return el ? el.closest<HTMLElement>('.sheet-tab') : null;
+}
+
+// Find a sheet tab under the pointer or nearest along the sheet bar horizontally
+function sheetTabAt(x: number, y: number): HTMLElement | null {
+  const direct = sheetTabUnder(x, y);
+  if (direct) return direct;
+
+  if (!sheetTabs) return null;
+  const barRect = sheetTabs.getBoundingClientRect();
+  if (y < barRect.top - 20 || y > barRect.bottom + 20) return null;
+
+  const tabs = Array.from(sheetTabs.querySelectorAll<HTMLElement>('.sheet-tab'));
+  for (const t of tabs) {
+    const r = t.getBoundingClientRect();
+    if (x >= r.left - 4 && x <= r.right + 4) return t;
+  }
+  return null;
+}
+
+let dragGhostEl: HTMLElement | null = null;
+
+function showDragGhost(moving: Doc[], x: number, y: number) {
+  if (!dragGhostEl) {
+    dragGhostEl = document.createElement('div');
+    dragGhostEl.className = 'drag-ghost';
+    document.body.appendChild(dragGhostEl);
+  }
+  const first = moving[0];
+  dragGhostEl.innerHTML = `
+    <svg class="drag-ghost-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+      <polyline points="14 2 14 8 20 8"></polyline>
+    </svg>
+    <span class="drag-ghost-title"></span>
+  `;
+  dragGhostEl.querySelector<HTMLElement>('.drag-ghost-title')!.textContent = first ? first.name : 'Document';
+  if (moving.length > 1) {
+    const badge = document.createElement('span');
+    badge.className = 'drag-ghost-count';
+    badge.textContent = `+${moving.length - 1}`;
+    dragGhostEl.appendChild(badge);
+  }
+  dragGhostEl.style.left = `${x}px`;
+  dragGhostEl.style.top = `${y}px`;
+  dragGhostEl.style.display = 'inline-flex';
+  dragGhostEl.hidden = false;
+  document.body.style.cursor = 'grabbing';
+}
+
+function showSheetDragGhost(name: string, x: number, y: number) {
+  if (!dragGhostEl) {
+    dragGhostEl = document.createElement('div');
+    dragGhostEl.className = 'drag-ghost';
+    document.body.appendChild(dragGhostEl);
+  }
+  dragGhostEl.innerHTML = `
+    <svg class="drag-ghost-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+      <line x1="3" y1="9" x2="21" y2="9"></line>
+      <line x1="9" y1="21" x2="9" y2="9"></line>
+    </svg>
+    <span class="drag-ghost-title"></span>
+  `;
+  dragGhostEl.querySelector<HTMLElement>('.drag-ghost-title')!.textContent = name;
+  dragGhostEl.style.left = `${x}px`;
+  dragGhostEl.style.top = `${y}px`;
+  dragGhostEl.style.display = 'inline-flex';
+  dragGhostEl.hidden = false;
+  document.body.style.cursor = 'grabbing';
+}
+
+function updateDragGhost(x: number, y: number) {
+  if (!dragGhostEl || dragGhostEl.hidden) return;
+  dragGhostEl.style.left = `${x}px`;
+  dragGhostEl.style.top = `${y}px`;
+}
+
+function hideDragGhost() {
+  if (dragGhostEl) {
+    dragGhostEl.hidden = true;
+    dragGhostEl.style.display = 'none';
+    if (dragGhostEl.parentNode) dragGhostEl.parentNode.removeChild(dragGhostEl);
+    dragGhostEl = null;
+  }
+  document.body.style.cursor = '';
+}
+
+function cancelDrag() {
+  hideDragGhost();
+  clearDropMarks();
+  if (dragState) {
+    const moving = dragDocs(dragState.doc);
+    for (const doc of moving) docRow.get(doc)?.classList.remove('dragging');
+    dragState = null;
+  }
+  sheetTabDragState = null;
+}
+
+// Window blur or pointer cancel immediately purges any stray drag state.
+window.addEventListener('blur', cancelDrag);
+window.addEventListener('pointercancel', cancelDrag);
+document.addEventListener('mouseleave', (e) => {
+  if (e.target === document || e.relatedTarget == null) cancelDrag();
+});
+
 // Once a press has moved past a small threshold it becomes a drag: highlight
 // the row that would receive the drop (accent line above/below).
 document.addEventListener('pointermove', (e) => {
-  if (!dragState) return;
+  // 1. Reordering sheet tabs
+  if (sheetTabDragState) {
+    if (e.buttons === 0) {
+      cancelDrag();
+      return;
+    }
+    if (!sheetTabDragState.moved) {
+      if (Math.hypot(e.clientX - sheetTabDragState.startX, e.clientY - sheetTabDragState.startY) < 4) return;
+      sheetTabDragState.moved = true;
+      const draggingTab = sheetTabs?.querySelector<HTMLElement>(`.sheet-tab[data-sheet-id="${sheetTabDragState.sheetId}"]`);
+      draggingTab?.classList.add('sheet-dragging');
+      showSheetDragGhost(sheetTabDragState.name, e.clientX, e.clientY);
+    } else {
+      updateDragGhost(e.clientX, e.clientY);
+    }
+
+    sheetTabs?.querySelectorAll('.sheet-tab').forEach((el) => el.classList.remove('drop-before', 'drop-after'));
+    const overTab = sheetTabAt(e.clientX, e.clientY);
+    if (overTab && overTab.dataset.sheetId && overTab.dataset.sheetId !== sheetTabDragState.sheetId) {
+      const r = overTab.getBoundingClientRect();
+      const after = e.clientX > r.left + r.width / 2;
+      overTab.classList.toggle('drop-after', after);
+      overTab.classList.toggle('drop-before', !after);
+    }
+    return;
+  }
+
+  // 2. Document reorder or moving doc to sheet tab
+  if (!dragState) {
+    if (dragGhostEl) hideDragGhost();
+    return;
+  }
+
+  // Safety net: if mouse buttons are released without a pointerup event
+  // (e.g. dropped outside or captured by OS), purge the drag state immediately.
+  if (e.buttons === 0) {
+    cancelDrag();
+    return;
+  }
+
   const moving = dragDocs(dragState.doc);
   if (!dragState.moved) {
     if (Math.abs(e.clientY - dragState.startY) < 4) return;
     dragState.moved = true;
     for (const doc of moving) docRow.get(doc)?.classList.add('dragging');
+    showDragGhost(moving, e.clientX, e.clientY);
+  } else {
+    updateDragGhost(e.clientX, e.clientY);
   }
   clearDropMarks();
+
+  const overTab = sheetTabAt(e.clientX, e.clientY);
+  if (overTab && overTab.dataset.sheetId !== sheetStore.activeSheetId) {
+    overTab.classList.add('drag-over');
+    return;
+  }
+
   const over = rowUnder(e.clientX, e.clientY);
   const overDoc = over ? rowDoc.get(over) : null;
   // Rows travelling with the pointer can't also be the drop target.
@@ -1398,9 +1762,44 @@ document.addEventListener('pointermove', (e) => {
   }
 });
 
-document.addEventListener('pointerup', (e) => {
+document.addEventListener('pointerup', async (e) => {
+  // 1. Sheet tab reorder or merge release
+  if (sheetTabDragState) {
+    const st = sheetTabDragState;
+    sheetTabDragState = null;
+    hideDragGhost();
+    try {
+      st.tab.releasePointerCapture(st.pointerId);
+    } catch {}
+
+    const overTab = sheetTabAt(e.clientX, e.clientY);
+    clearDropMarks();
+
+    if (st.moved) {
+      if (overTab && overTab.dataset.sheetId && overTab.dataset.sheetId !== st.sheetId) {
+        const targetSheetId = overTab.dataset.sheetId;
+        const r = overTab.getBoundingClientRect();
+        const after = e.clientX > r.left + r.width / 2;
+        const reordered = sheetStore.moveSheetRelativeTo(st.sheetId, targetSheetId, after);
+        if (reordered) {
+          renderSheetBar();
+          saveSession();
+        }
+      }
+    } else {
+      // Plain click on tab -> switch sheet
+      if (st.sheetId !== sheetStore.activeSheetId) {
+        void switchSheet(st.sheetId);
+      }
+    }
+    return;
+  }
+
+  // 2. Document reorder / move release
   const st = dragState;
   dragState = null;
+  hideDragGhost();
+  if (!st) return;
   if (!st) return;
   const moving = dragDocs(st.doc);
   for (const doc of moving) docRow.get(doc)?.classList.remove('dragging');
@@ -1422,8 +1821,67 @@ document.addEventListener('pointerup', (e) => {
   }
   lastReorderAt = Date.now(); // arm the native-drop guard around this reorder
   window.getSelection()?.removeAllRanges(); // clear any stray text selection
-  const over = rowUnder(e.clientX, e.clientY);
+
+  const overTab = sheetTabUnder(e.clientX, e.clientY);
   clearDropMarks();
+
+  // Dropped onto a sheet tab -> move doc(s) to that sheet and switch to it
+  if (overTab && overTab.dataset.sheetId && overTab.dataset.sheetId !== sheetStore.activeSheetId) {
+    const toSheetId = overTab.dataset.sheetId;
+    const fromSheetId = sheetStore.activeSheetId;
+    const toSheet = sheetStore.sheets.find((s) => s.id === toSheetId);
+
+    // Check for duplicates in destination sheet and prompt confirmation
+    if (toSheet) {
+      const duplicates = moving.filter(
+        (d) => d.path && toSheet.docs.some((td) => td.path === d.path)
+      );
+      if (duplicates.length > 0) {
+        const names = duplicates.map((d) => d.name).join(', ');
+        const ok = await confirmDialog(
+          `移動先シートに「${names}」が既に開かれています。移動して1つにまとめますか？（キャンセルすると移動を中止します）`
+        );
+        if (!ok) {
+          clearDropMarks();
+          focusDocList();
+          return;
+        }
+      }
+    }
+
+    // 1. Move doc in sheetStore (removes from fromSheet.docs, adds to toSheet.docs)
+    for (const d of moving) {
+      const ok = sheetStore.moveDoc(d, fromSheetId, toSheetId);
+      // Ensure global docs array is only updated if store move succeeded
+      if (ok) {
+        const idx = docs.indexOf(d);
+        if (idx !== -1) {
+          docs.splice(idx, 1);
+        }
+      }
+    }
+
+    // 2. If active doc was moved, update active to a remaining doc in the source sheet
+    if (active && moving.includes(active)) {
+      active = docs[0] || null;
+    }
+
+    overTab.classList.add('flash');
+    setTimeout(() => overTab.classList.remove('flash'), 300);
+
+    // Automatically switch to the destination sheet and activate the moved doc!
+    await switchSheet(toSheetId);
+    const primaryMoved = moving[0];
+    if (primaryMoved && docs.includes(primaryMoved)) {
+      await setActive(primaryMoved);
+    }
+
+    scheduleSessionSave();
+    focusDocList();
+    return;
+  }
+
+  const over = rowUnder(e.clientX, e.clientY);
   const target = over ? rowDoc.get(over) : null;
   if (target && !moving.includes(target)) {
     const r = over!.getBoundingClientRect();
@@ -1443,7 +1901,7 @@ document.addEventListener('pointerup', (e) => {
 document.addEventListener(
   'dragstart',
   (e) => {
-    if ((e.target as HTMLElement)?.closest?.('#doc-list')) e.preventDefault();
+    if ((e.target as HTMLElement)?.closest?.('#doc-list, #sheet-bar')) e.preventDefault();
   },
   true
 );
@@ -1813,20 +2271,49 @@ const SESSION_KEY = 'mrdown.session';
 // travels alongside `workingText` so restore can tell a draft from a clean file
 // even if that file later changed on disk or vanished.
 function saveSession() {
-  const openDocs = docs.map((d) => ({
-    path: d.path,
-    name: d.name,
-    workingText: d.workingText,
-    savedSource: d.savedSource,
-    mtime: d.mtime,
+  const cur = sheetStore.activeSheet;
+  if (cur) {
+    cur.docs = [...docs];
+    cur.activeId = active ? (active.path || active.name) : null;
+    cur.folderRoots = [...folderRoots];
+    cur.expandedFolders = [...expandedFolders];
+  }
+
+  const storedSheets: StoredSheet[] = sheetStore.sheets.map((s) => ({
+    id: s.id,
+    name: s.name,
+    docs: s.docs.map((d) => ({
+      path: d.path,
+      name: d.name,
+      workingText: d.workingText,
+      savedSource: d.savedSource,
+      mtime: d.mtime,
+    })),
+    activeIndex: (() => {
+      if (s.id === sheetStore.activeSheetId && active) {
+        const idx = s.docs.indexOf(active);
+        if (idx >= 0) return idx;
+      }
+      if (s.activeId) {
+        const idx = s.docs.findIndex((d) => (d.path || d.name) === s.activeId);
+        if (idx >= 0) return idx;
+      }
+      return s.docs.length > 0 ? 0 : -1;
+    })(),
+    folderRoots: [...s.folderRoots],
+    expandedFolders: [...s.expandedFolders],
   }));
+
+  const payload: StoredSessionWithSheets = {
+    version: 2,
+    activeSheetId: sheetStore.activeSheetId,
+    sheets: storedSheets,
+  };
+
   try {
-    localStorage.setItem(
-      SESSION_KEY,
-      JSON.stringify({ docs: openDocs, activeIndex: active ? docs.indexOf(active) : -1 }),
-    );
-  } catch {
-    // localStorage full/unavailable: a lost session is non-fatal, so swallow it.
+    localStorage.setItem(SESSION_KEY, JSON.stringify(payload));
+  } catch (err) {
+    console.warn('Failed to save session to localStorage (storage quota exceeded?):', err);
   }
 }
 
@@ -2770,7 +3257,7 @@ function renderRecent(list: string[]) {
 
 openBtn.addEventListener('click', async () => {
   const selected = await open({
-    multiple: false,
+    multiple: true,
     // 文書は別の枠にする。**PDF の断りはここに出す** ── 開く前に読めるので、
     // 空で返ってきたときに「壊れている」ではなく「そう書いてあった」になる。
     filters: [
@@ -2778,7 +3265,11 @@ openBtn.addEventListener('click', async () => {
       { name: t('importLabel'), extensions: IMPORTABLE }
     ]
   });
-  if (selected) await openFile(selected as string);
+  if (!selected) return;
+  const paths = Array.isArray(selected) ? selected : [selected];
+  for (const p of paths) {
+    if (p) await openFile(p);
+  }
 });
 
 newBtn.addEventListener('click', () => newDoc());
@@ -5392,7 +5883,22 @@ function normalizedText(doc: Doc): Normalized {
 
 function runDocSearch() {
   docSearchResults.innerHTML = '';
-  if (docs.length === 0) {
+
+  if (sheetStore.activeSheet) {
+    sheetStore.activeSheet.docs = [...docs];
+  }
+
+  const allEntries = sheetStore.findAllDocs(() => true);
+  const docToSheet = new Map<Doc, Sheet<Doc>>();
+  for (const entry of allEntries) {
+    if (!docToSheet.has(entry.doc)) docToSheet.set(entry.doc, entry.sheet);
+  }
+  for (const d of docs) {
+    if (!docToSheet.has(d)) docToSheet.set(d, sheetStore.activeSheet);
+  }
+  const allDocs = Array.from(docToSheet.keys());
+
+  if (allDocs.length === 0) {
     docSearchSummary.textContent = t('docsearchNoDocs');
     return;
   }
@@ -5415,7 +5921,7 @@ function runDocSearch() {
 
   let totalHits = 0;
   let docsWithHits = 0;
-  for (const doc of docs) {
+  for (const doc of allDocs) {
     const text = doc.workingText;
     const norm = normalizedText(doc);
     // Quick reject: a word missing from the whole document can't share a line
@@ -5449,6 +5955,7 @@ function runDocSearch() {
     docsWithHits++;
     totalHits += lines.length;
 
+    const targetSheet = docToSheet.get(doc) || sheetStore.activeSheet;
     const group = document.createElement('div');
     group.className = 'docsearch-group';
     const head = document.createElement('div');
@@ -5458,6 +5965,12 @@ function runDocSearch() {
     count.className = 'docsearch-doc-count';
     count.textContent = String(lines.length);
     head.appendChild(count);
+
+    const sheetBadge = document.createElement('span');
+    sheetBadge.className = 'docsearch-sheet-badge';
+    sheetBadge.textContent = `[${targetSheet.name}]`;
+    head.appendChild(sheetBadge);
+
     group.appendChild(head);
 
     for (const [lineStart, g] of lines) {
@@ -5480,7 +5993,12 @@ function runDocSearch() {
         }
       }
       row.append(no, snippet);
-      row.addEventListener('click', () => navigateToHit(doc, hit.start, hit.end));
+      row.addEventListener('click', async () => {
+        if (targetSheet.id !== sheetStore.activeSheetId) {
+          await switchSheet(targetSheet.id);
+        }
+        await navigateToHit(doc, hit.start, hit.end);
+      });
       group.appendChild(row);
     }
     docSearchResults.appendChild(group);
@@ -5505,7 +6023,8 @@ async function navigateToHit(doc: Doc, start: number, end: number) {
 }
 
 function openDocSearch() {
-  if (docs.length === 0) return;
+  const allDocs = sheetStore.findAllDocs(() => true);
+  if (allDocs.length === 0 && docs.length === 0) return;
   docSearchOverlay.hidden = false;
   // Carry over whatever's in the in-document find box, so ⌘F → ⌘⇧F widens the
   // same query to every tab.
@@ -5925,24 +6444,45 @@ listen('fs-change', () => {
 // becomes a conflict rather than a silent reload or a silent overwrite.
 setInterval(async () => {
   const doc = active;
-  if (!doc?.path) return;
-  try {
-    const m = await invoke<number>('file_mtime', { path: doc.path });
-    if (doc.deletedOnDisk) {
-      doc.deletedOnDisk = false;
-      updateStatus();
+  if (doc?.path) {
+    try {
+      const m = await invoke<number>('file_mtime', { path: doc.path });
+      if (doc.deletedOnDisk) {
+        doc.deletedOnDisk = false;
+        updateStatus();
+      }
+      if (m > doc.mtime) {
+        if (!isEditing && !isDirty(doc)) await refreshActiveFromDisk(true, true);
+        else await noteDiskChange(doc, m);
+      }
+    } catch {
+      // File may have been moved/removed; leave the last render in place.
+      if (!doc.deletedOnDisk) {
+        doc.deletedOnDisk = true;
+        updateStatus();
+      }
     }
-    if (m <= doc.mtime) return;
-    // Nothing of ours is in flight, so just take the new content — but keep it,
-    // and what it replaced, in the timeline. "What did the AI change?" is only
-    // answerable if the versions it wrote are actually recorded.
-    if (!isEditing && !isDirty(doc)) await refreshActiveFromDisk(true, true);
-    else await noteDiskChange(doc, m);
-  } catch {
-    // File may have been moved/removed; leave the last render in place.
-    if (!doc.deletedOnDisk) {
-      doc.deletedOnDisk = true;
-      updateStatus();
+  }
+
+  // Also check background documents across all sheets for external modifications
+  for (const sheet of sheetStore.sheets) {
+    for (const d of sheet.docs) {
+      if (d !== active && d.path) {
+        try {
+          const m = await invoke<number>('file_mtime', { path: d.path });
+          if (m > d.mtime) {
+            if (!isDirty(d)) {
+              const text = await invoke<string>('read_file', { path: d.path });
+              d.workingText = text;
+              d.savedSource = text;
+              d.mtime = m;
+            } else {
+              d.mtime = m;
+              await noteDiskChange(d, m);
+            }
+          }
+        } catch {}
+      }
     }
   }
 }, 700);
@@ -5964,75 +6504,136 @@ function untitledIndex(name: string): number {
   return m ? Number(m[1]) : 0;
 }
 
+async function restoreDocFromStored(s: StoredDoc, newUntitledName: () => string): Promise<Doc | null> {
+  const hadDraft = s.workingText !== s.savedSource;
+  if (s.path == null) {
+    return { path: null, name: s.name, savedSource: s.savedSource, workingText: s.workingText, mtime: 0 };
+  }
+  const disk = await invoke<string>('read_file', { path: s.path }).catch(() => null);
+  if (disk == null) {
+    if (hadDraft) {
+      return { path: null, name: newUntitledName(), savedSource: '', workingText: s.workingText, mtime: 0 };
+    }
+    return null;
+  }
+  if (hadDraft) {
+    return { path: s.path, name: basename(s.path), savedSource: s.savedSource, workingText: s.workingText, mtime: s.mtime };
+  }
+  const mtime = await invoke<number>('file_mtime', { path: s.path }).catch(() => 0);
+  return { path: s.path, name: basename(s.path), savedSource: disk, workingText: disk, mtime };
+}
+
 // Restore the previous session, then handle a file the app was launched with.
 // Untitled buffers and unsaved edits are brought back verbatim; on-disk files
 // are re-read so external changes show, unless there's a draft to preserve.
 async function restoreSession() {
   const raw = localStorage.getItem(SESSION_KEY);
-  if (!raw) return;
-  let data: { docs?: StoredDoc[]; activeIndex?: number; paths?: string[]; active?: string | null };
+  if (!raw) {
+    renderSheetBar();
+    return;
+  }
+  let data: any;
   try {
     data = JSON.parse(raw);
-  } catch {
+  } catch (err) {
+    console.error('Corrupt session JSON found in localStorage:', err);
+    try {
+      localStorage.setItem(`${SESSION_KEY}.corrupt.${Date.now()}`, raw);
+    } catch {}
+    renderSheetBar();
     return;
   }
 
-  // Upgrade a legacy session (paths only) to the per-document shape; empty
-  // working/saved text means "not a draft", so it re-reads cleanly from disk.
-  const stored: StoredDoc[] = Array.isArray(data.docs)
-    ? data.docs
-    : (data.paths ?? []).map((p) => ({ path: p, name: basename(p), workingText: '', savedSource: '', mtime: 0 }));
-
-  let activeDoc: Doc | null = null;
-
-  // Number a rescued draft above every existing untitled buffer so the name
-  // (and any later save) never collides with a real untitled document.
   let nextUntitled = 0;
-  for (const s of stored) {
-    if (s.path == null) nextUntitled = Math.max(nextUntitled, untitledIndex(s.name));
-  }
   const newUntitledName = () => {
     nextUntitled += 1;
     return nextUntitled === 1 ? 'untitled' : `untitled ${nextUntitled}`;
   };
 
-  for (let i = 0; i < stored.length; i++) {
-    const s = stored[i];
-    const hadDraft = s.workingText !== s.savedSource;
-    let doc: Doc | null = null;
+  // Case 1: Multi-sheet session (version 2)
+  if (data && data.version === 2 && Array.isArray(data.sheets) && data.sheets.length > 0) {
+    const loadedSheets: Sheet<Doc>[] = [];
 
-    if (s.path == null) {
-      // Untitled buffer: nothing on disk, so bring the draft back as-is.
-      doc = { path: null, name: s.name, savedSource: s.savedSource, workingText: s.workingText, mtime: 0 };
-    } else {
-      const disk = await invoke<string>('read_file', { path: s.path }).catch(() => null);
-      if (disk == null) {
-        // The file is gone. Rescue an unsaved draft as a fresh untitled buffer so
-        // the work isn't lost; a clean doc has nothing to preserve, so drop it.
-        // A new "untitled" name (not the old basename) keeps it from masquerading
-        // as a saved file and avoids a doubled ".md.md" in the save dialog.
-        if (hadDraft) {
-          doc = { path: null, name: newUntitledName(), savedSource: '', workingText: s.workingText, mtime: 0 };
+    // Find highest untitled index across all sheets
+    for (const sh of data.sheets as StoredSheet[]) {
+      if (Array.isArray(sh.docs)) {
+        for (const s of sh.docs) {
+          if (s.path == null) nextUntitled = Math.max(nextUntitled, untitledIndex(s.name));
         }
-      } else if (hadDraft) {
-        // Keep the unsaved draft over the disk content. Preserve the baseline the
-        // user was editing against so the dirty state stays meaningful; auto-reload
-        // is paused while dirty, so any newer disk version waits until they resolve it.
-        doc = { path: s.path, name: basename(s.path), savedSource: s.savedSource, workingText: s.workingText, mtime: s.mtime };
-      } else {
-        // No unsaved work: adopt the current disk content (picks up external edits).
-        const mtime = await invoke<number>('file_mtime', { path: s.path }).catch(() => 0);
-        doc = { path: s.path, name: basename(s.path), savedSource: disk, workingText: disk, mtime };
       }
     }
 
+    for (const sh of data.sheets as StoredSheet[]) {
+      const sheetDocs: Doc[] = [];
+      let sheetActiveDoc: Doc | null = null;
+      if (Array.isArray(sh.docs)) {
+        for (let i = 0; i < sh.docs.length; i++) {
+          const doc = await restoreDocFromStored(sh.docs[i], newUntitledName);
+          if (doc) {
+            sheetDocs.push(doc);
+            if (i === sh.activeIndex) sheetActiveDoc = doc;
+          }
+        }
+      }
+      loadedSheets.push({
+        id: sh.id || generateSheetId(),
+        name: sh.name || 'Sheet',
+        docs: sheetDocs,
+        activeId: sheetActiveDoc ? (sheetActiveDoc.path || sheetActiveDoc.name) : (sheetDocs[0] ? (sheetDocs[0].path || sheetDocs[0].name) : null),
+        folderRoots: Array.isArray(sh.folderRoots) ? sh.folderRoots : [],
+        expandedFolders: Array.isArray(sh.expandedFolders) ? sh.expandedFolders : [],
+      });
+    }
+
+    sheetStore = new SheetStore<Doc>(loadedSheets, data.activeSheetId);
+    untitledCount = Math.max(untitledCount, nextUntitled);
+
+    const activeSheet = sheetStore.activeSheet;
+    docs = activeSheet.docs;
+    await setFolderRootsForSheet(activeSheet.folderRoots, activeSheet.expandedFolders);
+
+    const target = docs.find((d) => (d.path || d.name) === activeSheet.activeId) || docs[0] || null;
+    if (target) {
+      active = target;
+      lastActiveDirty = isDirty(target);
+      editor.value = target.workingText;
+      await renderSource(target.workingText, target.path ?? '');
+      showDocUI();
+      updateStatus();
+    }
+    renderSidebar();
+    renderSheetBar();
+    return;
+  }
+
+  // Case 2: Legacy single-sheet session
+  const stored: StoredDoc[] = Array.isArray(data.docs)
+    ? data.docs
+    : (data.paths ?? []).map((p: string) => ({ path: p, name: basename(p), workingText: '', savedSource: '', mtime: 0 }));
+
+  for (const s of stored) {
+    if (s.path == null) nextUntitled = Math.max(nextUntitled, untitledIndex(s.name));
+  }
+
+  let activeDoc: Doc | null = null;
+  for (let i = 0; i < stored.length; i++) {
+    const doc = await restoreDocFromStored(stored[i], newUntitledName);
     if (!doc) continue;
     docs.push(doc);
     if (i === data.activeIndex) activeDoc = doc;
   }
 
-  // Number new untitled docs above anything restored (or rescued) so names never collide.
   untitledCount = Math.max(untitledCount, nextUntitled);
+
+  const initialSheet: Sheet<Doc> = {
+    id: generateSheetId(),
+    name: 'Sheet 1',
+    docs: docs,
+    activeId: activeDoc ? (activeDoc.path || activeDoc.name) : (docs[0] ? (docs[0].path || docs[0].name) : null),
+    folderRoots: [...folderRoots],
+    expandedFolders: [...expandedFolders],
+  };
+  sheetStore = new SheetStore<Doc>([initialSheet], initialSheet.id);
 
   const target = activeDoc
     ?? docs.find((d) => d.path != null && d.path === data.active)
@@ -6047,6 +6648,7 @@ async function restoreSession() {
     updateStatus();
   }
   renderSidebar();
+  renderSheetBar();
 }
 
 // Runtime opens (app already running) arrive as an event.

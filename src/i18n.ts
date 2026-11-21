@@ -302,6 +302,8 @@ const DICT = {
     renameFailed: '名前の変更に失敗しました',
     fileExists: '同名のファイルが既に存在します',
     invalidName: 'ファイル名が無効です',
+    addSheet: '新しいシートを追加',
+    deleteSheet: 'シートを削除',
   },
   en: {
     btnSidebar: 'Documents (⌘1)',
@@ -583,6 +585,8 @@ const DICT = {
     renameFailed: 'Failed to rename',
     fileExists: 'A file with this name already exists',
     invalidName: 'Invalid file name',
+    addSheet: 'Add New Sheet',
+    deleteSheet: 'Delete Sheet',
   },
 } as const;
 

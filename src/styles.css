@@ -250,6 +250,204 @@ button:disabled { opacity: 0.3; cursor: default; }
   padding: 8px 0;
 }
 body.sidebar-hidden #sidebar { display: none; }
+
+/* Main Stage: encapsulates content area and the bottom sheet bar */
+.main-stage {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  position: relative;
+}
+
+/* Sheet Bar at the bottom of the main content area (Excel-style) */
+.sheet-bar {
+  display: flex;
+  align-items: center;
+  background: var(--mrd-surface);
+  border-top: 1px solid var(--mrd-border);
+  padding: 3px 10px;
+  gap: 6px;
+  min-height: 32px;
+  max-height: 32px;
+  flex-shrink: 0;
+  user-select: none;
+  z-index: 10;
+}
+
+.sheet-tabs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  flex: 1;
+  min-width: 0;
+  scrollbar-width: none;
+}
+.sheet-tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.sheet-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--mrd-muted);
+  background: var(--mrd-surface-2, rgba(0, 0, 0, 0.04));
+  border: 1px solid var(--mrd-border, rgba(0, 0, 0, 0.08));
+  border-radius: 5px;
+  cursor: pointer;
+  white-space: nowrap;
+  user-select: none;
+  transition: all 0.12s ease;
+}
+
+.sheet-tab:hover {
+  background: var(--mrd-surface-3, rgba(0, 0, 0, 0.08));
+  color: var(--mrd-text);
+  border-color: var(--mrd-border);
+}
+
+.sheet-tab.active {
+  background: var(--mrd-bg);
+  color: var(--mrd-accent);
+  border-color: var(--mrd-border, rgba(0, 0, 0, 0.15));
+  font-weight: 600;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
+}
+
+.sheet-tab.sheet-dragging {
+  opacity: 0.35;
+  transform: scale(0.96);
+}
+.sheet-tab.drop-before {
+  box-shadow: inset 3px 0 0 var(--mrd-accent);
+}
+.sheet-tab.drop-after {
+  box-shadow: inset -3px 0 0 var(--mrd-accent);
+}
+
+.sheet-tab.drag-over {
+  outline: 2px solid var(--mrd-accent);
+  outline-offset: -1px;
+  background: rgba(79, 47, 201, 0.16);
+  color: var(--mrd-accent);
+  transform: translateY(-2px) scale(1.05);
+  box-shadow: 0 4px 12px rgba(79, 47, 201, 0.25);
+}
+
+.sheet-tab.flash {
+  animation: sheet-flash 0.35s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+}
+@keyframes sheet-flash {
+  0% { transform: scale(1); }
+  50% { transform: translateY(-3px) scale(1.1); background: var(--mrd-accent); color: #fff; }
+  100% { transform: scale(1); }
+}
+
+/* Floating drag badge following the pointer */
+.drag-ghost {
+  position: fixed;
+  z-index: 99999;
+  pointer-events: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  background: var(--mrd-surface);
+  color: var(--mrd-text);
+  border: 1.5px solid var(--mrd-accent);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.22), 0 2px 6px rgba(0, 0, 0, 0.1);
+  font-size: 12px;
+  font-weight: 600;
+  transform: translate(12px, 12px) rotate(2.5deg);
+  white-space: nowrap;
+  opacity: 0.95;
+  backdrop-filter: blur(8px);
+}
+.drag-ghost-icon {
+  width: 14px;
+  height: 14px;
+  color: var(--mrd-accent);
+  flex-shrink: 0;
+}
+.drag-ghost-count {
+  background: var(--mrd-accent);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  border-radius: 9px;
+  padding: 1px 6px;
+  margin-left: 2px;
+}
+
+.sheet-tab-name {
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sheet-tab-input {
+  font-size: 12px;
+  padding: 1px 4px;
+  width: 110px;
+  border: 1px solid var(--mrd-accent);
+  border-radius: 3px;
+  background: var(--mrd-bg);
+  color: var(--mrd-text);
+  outline: none;
+}
+
+.sheet-tab-close {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  border-radius: 7px;
+  border: none;
+  background: transparent;
+  color: var(--mrd-muted);
+  cursor: pointer;
+  padding: 0;
+  line-height: 1;
+}
+.sheet-tab:hover .sheet-tab-close {
+  display: inline-flex;
+}
+.sheet-tab-close:hover {
+  background: var(--mrd-surface-3);
+  color: var(--mrd-text);
+}
+
+.sheet-add-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 5px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--mrd-muted);
+  cursor: pointer;
+  flex-shrink: 0;
+  padding: 0;
+  transition: all 0.12s ease;
+}
+.sheet-add-btn:hover {
+  background: var(--mrd-surface-2);
+  border-color: var(--mrd-border);
+  color: var(--mrd-text);
+}
 /* Not scoped to #sidebar: the outline wears this too, and it can live outside
    the sidebar (see #outline below). */
 .sidebar-title {
@@ -1351,6 +1549,12 @@ body.has-doc #output { display: block; }
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-weight: 400;
   color: var(--mrd-faint);
+}
+.docsearch-sheet-badge {
+  font-size: 11px;
+  color: var(--mrd-faint);
+  font-weight: 400;
+  margin-left: auto;
 }
 .docsearch-hit {
   display: flex;
