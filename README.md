@@ -12,6 +12,10 @@ every rewrite that arrives from outside the app. **Git is optional.**
 *An agent rewrote the file while there were unsaved edits in the window. MrMarkdown neither reloads over you nor overwrites what arrived — it shows **last save / on disk / my edits** side by side and lets you choose. [Watch the 20-second demo.](docs/media/demo-en.mp4)*
 
 <p align="center">
+  <img src="docs/media/hero-en.png" width="100%" alt="MrMarkdown main interface with folders and open documents in the sidebar, sheet switcher at the bottom, and outline on the right">
+</p>
+
+<p align="center">
   <img src="docs/media/shot-timeline-en.png" width="49%" alt="The History panel comparing a version from 14 days ago with the current text, with HEAD (Git) in the same list">
   <img src="docs/media/shot-compare-en.png" width="49%" alt="Two separate files compared in the same view, word-level changes marked">
 </p>
@@ -97,6 +101,8 @@ The default is one column. When checking Markdown written by an AI, one readable
 
 ### Many documents at once
 
+- **Sheets (Workspaces)**: Create, switch, and reorder multiple sheets from the bottom sheet bar. Each sheet maintains its own open documents, folder tree, and active file, allowing you to separate different projects or tasks without opening multiple windows. Supports drag-and-drop tab reordering and double-click renaming. All sheets are restored seamlessly on relaunch.
+- **Open multiple files at once**: Select multiple Markdown files at once via `⌘O` or the open dialog to load them into the current sheet in one go.
 - Keep multiple documents open in a sidebar (BBEdit-style): click to switch — or `↑`/`↓` once the list has focus — close with the circled × (`⌘W`), toggle the sidebar with `⌘1`; the open set is restored on next launch.
 - Put that list in the order you read it: drag a row, or move it with `⌘↑`/`⌘↓`. `⌘`-click and `⇧`-click select several rows, which then drag and move as one block. The order is remembered with the session.
 - Open a folder to browse its Markdown files as a set: pick files from a left-hand tree and expand/collapse subfolders; the opened folder is restored on next launch.
